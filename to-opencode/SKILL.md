@@ -1,31 +1,19 @@
 ---
 name: to-opencode
-description: Use this skill whenever a coding task is large enough that implementing it directly in this session would burn significant context or tokens. Instead of writing specs, tests, models, or implementation code inline, this skill turns Claude into an ultra-lean architect/orchestrator that explores the codebase via subagents, designs the solution, and generates a single queued batch bash script of stateless `claude -p` and `opencode run` calls, launched in the background. Trigger this for requests like "build this feature end to end", "implement X without blowing up context", "delegate this to opencode", "queue up a batch job for this", or any multi-file feature/spec/test/implementation work where the user wants Claude to orchestrate rather than hand-write every file in the live conversation.
+description: Use when a coding task is big enough that writing it inline would burn significant context — multi-file features, spec+test+implementation chains, or refactors the user wants delegated rather than hand-written in this session ("build this end to end", "delegate this to opencode", "queue up a batch job", "without blowing up context"). Skip it for a one-file fix.
 ---
 
 # to-opencode
 
-Act as an ultra-lean Architect and Orchestrator. The point of this skill is to keep the main interactive session cheap: it explores and designs, but it never drafts specs, tests, models, or implementation code inline. All of that work happens in stateless CLI subprocesses (`claude -p` and `opencode run`), chained together in one generated batch script and launched in the background. The session's job is architecture and supervision, not typing code.
-
-## When to use
-
-Use this whenever a task is big enough that writing the code directly in this session would mean holding many files' worth of content in context — new features, multi-file refactors, spec+test+implementation chains, or anything the user frames as "build this without burning context." Don't use it for a quick one-file fix; the overhead of spinning up a batch script isn't worth it for something you'd finish in two tool calls anyway.
+Act as an ultra-lean Architect and Orchestrator: explore and design, but never draft specs, tests, models, or implementation code inline. All of that work happens in stateless CLI subprocesses (`claude -p` and `opencode run`), chained together in one generated batch script and launched in the background. The session's job is architecture and supervision, not typing code.
 
 ## 1. Architectural role & session constraints
 
 * **Zero direct file writes.** Do not invoke `Write` or `Edit` in this session to draft specs, models, tests, or application logic. If you catch yourself about to write implementation code inline, stop — that work belongs in a queued CLI call.
 * **Exploration & planning.** Use subagents to inspect the codebase, outline the architecture, and formulate the task chain (which files, in what order, with what contracts between them).
-* **Project-specific temp paths.** Never use a bare `/tmp/` path — concurrent projects/sessions would collide. Derive a project-scoped path:
+* **Project-scoped paths.** Never use a bare `/tmp/` path — concurrent projects/sessions would collide. Derive `PROJECT_NAME=$(basename "$PWD")` and `TMP_DIR="/tmp/claude_opencode_${PROJECT_NAME}"` once (`mkdir -p "$TMP_DIR"`); the script skeleton in §2 defines these as its first lines, and every path below reuses them.
+* **Pre-launch hygiene & launch.** Immediately before running the batch script, clean up only this project's leftover processes/snapshots — never touch other projects' state:
   ```bash
-  PROJECT_NAME=$(basename "$PWD")
-  TMP_DIR="/tmp/claude_opencode_${PROJECT_NAME}"
-  mkdir -p "$TMP_DIR"
-  ```
-* **Project-scoped pre-launch hygiene & launch.** Immediately before running the batch script, clean up only this project's leftover processes/snapshots — never touch other projects' state:
-  ```bash
-  PROJECT_NAME=$(basename "$PWD")
-  TMP_DIR="/tmp/claude_opencode_${PROJECT_NAME}"
-  mkdir -p "$TMP_DIR"
   pkill -9 -f "opencode.*${PROJECT_NAME}" || true
   pkill -9 -f "${TMP_DIR}" || true
   find ~/.local/share/opencode/snapshot -maxdepth 2 -name "*${PROJECT_NAME}*" -exec rm -rf {} + 2>/dev/null || true
@@ -38,7 +26,7 @@ Use this whenever a task is big enough that writing the code directly in this se
 
 ## 2. Script setup & configuration
 
-* **Skeleton.** Start with `set -u`. Define `PROJECT_NAME`, `TMP_DIR`, `mkdir -p "$TMP_DIR"`. Work on a dedicated feature branch — never commit directly to `main`. Add the log file, `$TMP_DIR`, and local configs to `.git/info/exclude` so they never leak into the repo's tracked state.
+* **Skeleton.** Start with `set -u`, then the project-scoped paths from §1, then `LOG="$PWD/batch_execution.log"` (absolute, captured before any `cd`) — this is the one file everything writes to: `cl`/`oc` helpers, the PTY wrapper, test runs, commits, the watchdog. The `>> ./batch_execution.log 2>&1` redirect on the outer launch command in §1 targets this same path as a catch-all for anything not explicitly piped to `$LOG` (e.g. a bare `echo` or a `set -u` failure). Work on a dedicated feature branch — never commit directly to `main`. Add the log file, `$TMP_DIR`, and local configs to `.git/info/exclude` so they never leak into the repo's tracked state.
 * **Provider timeout fix.** Before any `opencode` calls, ensure a local, git-excluded `.opencode.json` exists with extended timeouts (local models can be slow to first token):
   ```json
   { "provider": { "ollama": { "options": { "chunkTimeout": 86400000, "headerTimeout": 86400000 } } } }
@@ -48,7 +36,7 @@ Use this whenever a task is big enough that writing the code directly in this se
   ```bash
   git add -A <workspace dirs> .opencode && git commit -m "<conventional msg>" -m "Co-Authored-By: Claude/Opencode"
   ```
-* **Helper functions.** Define shell helpers (`cl` for `claude` calls, `oc` for `opencode` calls) that log start/exit timestamps, check process exit codes, run targeted tests, verify SHA1 hashes, and trigger the commit — so each call site in the script is one line, not a repeated block.
+* **Helper functions.** Define shell helpers (`cl` for `claude` calls, `oc` for `opencode` calls) that log start/exit timestamps, check process exit codes, run targeted tests, verify SHA1 hashes, and trigger the commit — so each call site in the script is one line, not a repeated block. Both helpers redirect everything they produce — including each `claude`/`opencode` call's own stdout, stderr, and debug output (e.g. `opencode run`'s `--print-logs`) — to `$LOG`; no helper or call site opens a log file of its own.
 * **Final verification.** End the script with: full test suite + linting + production build, each logged PASS/FAIL; `opencode session delete` for every session created in this project; `git log main..HEAD`; cleanup of `$TMP_DIR`; and `echo "<FEATURE_NAME> DONE"`.
 
 ## 3. Phase A — specs, types, models & tests (`claude` CLI)
@@ -65,7 +53,7 @@ Use this whenever a task is big enough that writing the code directly in this se
 
 * **Strictly sequential.** One `opencode` process at a time — no `&` backgrounding inside the script. Local models and shared snapshot state don't tolerate concurrent runs here.
 * **Disable web access.** Write `.opencode/agent/<name>.md` with `permission: { webfetch: deny, websearch: deny }`, pass `--agent <name>` on every call, and add to every prompt: "Do not use WebFetch, websearch, or access the internet."
-* **PTY/TTY wrapper.** Wrap each call so stdout doesn't block-buffer or collide across sessions:
+* **PTY/TTY wrapper.** Wrap each call so stdout doesn't block-buffer or collide across sessions. `script`'s own transcript goes to `/dev/null` (it's only there to allocate a pty); the shell redirect sends the call's actual stdout/stderr — opencode's debug output included — to the single `$LOG` from §2:
   ```bash
   script -qec "opencode run --agent <name> --auto --print-logs -m ollama/qwen-agent:latest \"\$(cat \"$TMP_DIR/prompt.md\")\"" /dev/null >> "$LOG" 2>&1 < /dev/null
   ```
