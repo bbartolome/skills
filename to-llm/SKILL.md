@@ -1,5 +1,5 @@
 ---
-name: "navigator-driver"
+name: "to-llm"
 description: "Pair with a local Ollama navigator that sets the plan and settles your questions while you implement, supply context, run its tool calls and challenge its claims. Use for navigator/driver pairing."
 ---
 
